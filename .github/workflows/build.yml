@@ -1,0 +1,103 @@
+name: Encrypted VetCore release build
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: encrypted-vetcore-release
+  cancel-in-progress: true
+
+jobs:
+  archive:
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decrypt release source
+        env:
+          RELEASE_BUNDLE_KEY: ${{ secrets.RELEASE_BUNDLE_KEY }}
+        run: |
+          mkdir source
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -in release-source.tar.gz.enc \
+            -out release-source.tar.gz \
+            -pass env:RELEASE_BUNDLE_KEY
+          tar -xzf release-source.tar.gz -C source
+          rm release-source.tar.gz
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+
+      - name: Cache Rust builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            source/research/build-brief/petlab-proof/target
+            source/research/build-brief/mediavault-proof/target
+            source/research/build-brief/livephoto-proof/target
+            source/research/build-brief/shrinkr/target
+            source/research/mini-film/engine-proof/target
+            source/third_party/metapdf/target
+          key: vetcore-encrypted-rust-v1-${{ runner.os }}
+
+      - name: Build CoreFFI XCFrameworks
+        working-directory: source/research/integration/handoff-kit
+        run: |
+          ./scripts/build-xcframework.sh petlab ../../build-brief/petlab-proof --symbol-only
+          ./scripts/build-xcframework.sh mediavault ../../build-brief/mediavault-proof --symbol-only
+          ./scripts/build-xcframework.sh livephoto ../../build-brief/livephoto-proof --symbol-only
+          ./scripts/build-xcframework.sh minifilm ../../mini-film/engine-proof --symbol-only
+          ./scripts/build-xcframework.sh docforge ../../../third_party/metapdf/engine_rs --symbol-only
+
+      - name: Generate Xcode project
+        working-directory: source/apps/ios
+        run: xcodegen generate
+
+      - name: Archive unsigned release
+        working-directory: source
+        run: |
+          mkdir -p .build/app-store
+          xcodebuild \
+            -project apps/ios/PetVetOS.xcodeproj \
+            -scheme PetVetOS \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath .build/app-store/VetCore-1.2-3-ci.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            archive
+          test -f .build/app-store/VetCore-1.2-3-ci.xcarchive/Products/Applications/PetVetOS.app/Assets.car
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleShortVersionString' .build/app-store/VetCore-1.2-3-ci.xcarchive/Info.plist)" = "1.2"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleVersion' .build/app-store/VetCore-1.2-3-ci.xcarchive/Info.plist)" = "3"
+
+      - name: Encrypt archive
+        working-directory: source
+        env:
+          RELEASE_BUNDLE_KEY: ${{ secrets.RELEASE_BUNDLE_KEY }}
+        run: |
+          tar -C .build/app-store -czf VetCore-1.2-3-ci.xcarchive.tar.gz VetCore-1.2-3-ci.xcarchive
+          openssl enc -aes-256-cbc -salt -pbkdf2 \
+            -in VetCore-1.2-3-ci.xcarchive.tar.gz \
+            -out VetCore-1.2-3-ci.xcarchive.tar.gz.enc \
+            -pass env:RELEASE_BUNDLE_KEY
+          rm VetCore-1.2-3-ci.xcarchive.tar.gz
+
+      - name: Upload encrypted archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: VetCore-1.2-3-encrypted-xcarchive
+          path: source/VetCore-1.2-3-ci.xcarchive.tar.gz.enc
+          if-no-files-found: error
+          retention-days: 1
